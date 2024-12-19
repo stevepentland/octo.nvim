@@ -133,17 +133,10 @@ local function develop_issue(prompt_bufnr, type)
   local selection = action_state.get_selected_entry(prompt_bufnr)
   actions.close(prompt_bufnr)
 
-  utils.develop_issue(selection.obj.number)
+  utils.develop_issue(selection.repo, selection.obj.number, nil)
 end
 
 function M.issues(opts, develop)
-  local replace
-  if develop then
-    replace = develop_issue
-  else
-    replace = open_issue_buffer
-  end
-
   opts = opts or {}
   if not opts.states then
     opts.states = "OPEN"
@@ -155,6 +148,13 @@ function M.issues(opts, develop)
   if not opts.repo then
     utils.error "Cannot find repo"
     return
+  end
+
+  local replace
+  if develop then
+    replace = develop_issue
+  else
+    replace = open_issue_buffer
   end
 
   local owner, name = utils.split_repo(opts.repo)
@@ -183,6 +183,7 @@ function M.issues(opts, develop)
         opts.preview_title = opts.preview_title or ""
         opts.prompt_title = opts.prompt_title or ""
         opts.results_title = opts.results_title or ""
+
         pickers
           .new(opts, {
             finder = finders.new_table {
@@ -501,16 +502,52 @@ end
 ---
 -- SEARCH
 ---
+
+local function get_search_query(prompt)
+  local full_prompt = prompt[1]
+  local parts = vim.split(full_prompt, " ")
+  for _, part in ipairs(parts) do
+    if string.match(part, "^repo:") then
+      return {
+        single_repo = true,
+        prompt = part,
+      }
+    end
+  end
+  return {
+    single_repo = false,
+    prompt = full_prompt,
+  }
+end
+
+local function get_search_size(prompt)
+  local query = graphql("search_count_query", prompt)
+  local output = gh.run {
+    args = { "api", "graphql", "-f", string.format("query=%s", query) },
+    mode = "sync",
+  }
+  local resp = vim.fn.json_decode(output)
+  return resp.data.search.issueCount
+end
+
 function M.search(opts)
   opts = opts or {}
   local cfg = octo_config.values
+  if type(opts.prompt) == "string" then
+    opts.prompt = { opts.prompt }
+  end
+
+  local search = get_search_query(opts.prompt)
+  local width = 6
+  if search.single_repo then
+    local num_results = get_search_size(search.prompt)
+    width = math.min(#tostring(num_results), width)
+  end
+
   local requester = function()
     return function(prompt)
-      if not opts.prompt and utils.is_blank(prompt) then
+      if utils.is_blank(opts.prompt) and utils.is_blank(prompt) then
         return {}
-      end
-      if type(opts.prompt) == "string" then
-        opts.prompt = { opts.prompt }
       end
       local results = {}
       for _, val in ipairs(opts.prompt) do
@@ -535,13 +572,13 @@ function M.search(opts)
   end
   local finder = finders.new_dynamic {
     fn = requester(),
-    entry_maker = entry_maker.gen_from_issue(6),
+    entry_maker = entry_maker.gen_from_issue(width),
   }
   if opts.static then
     local results = requester() ""
     finder = finders.new_table {
       results = results,
-      entry_maker = entry_maker.gen_from_issue(6, true),
+      entry_maker = entry_maker.gen_from_issue(width, true),
     }
   end
   opts.preview_title = opts.preview_title or ""
@@ -704,6 +741,31 @@ end
 --
 -- LABELS
 --
+
+local function select(opts)
+  local prompt_bufnr = opts.bufnr
+  local single_cb = opts.single_cb
+  local multiple_cb = opts.multiple_cb
+  local get_item = opts.get_item
+
+  local picker = action_state.get_current_picker(prompt_bufnr)
+  local selections = picker:get_multi_selection()
+  local cb
+  local items = {}
+  if #selections == 0 then
+    local selection = action_state.get_selected_entry(prompt_bufnr)
+    table.insert(items, get_item(selection))
+    cb = single_cb
+  else
+    for _, selection in ipairs(selections) do
+      table.insert(items, get_item(selection))
+    end
+    cb = multiple_cb
+  end
+  actions.close(prompt_bufnr)
+  cb(items)
+end
+
 function M.select_label(cb)
   local opts = vim.deepcopy(dropdown_opts)
   local bufnr = vim.api.nvim_get_current_buf()
@@ -730,9 +792,14 @@ function M.select_label(cb)
             sorter = conf.generic_sorter(opts),
             attach_mappings = function(_, _)
               actions.select_default:replace(function(prompt_bufnr)
-                local selected_label = action_state.get_selected_entry(prompt_bufnr)
-                actions.close(prompt_bufnr)
-                cb(selected_label.label.id)
+                select {
+                  bufnr = prompt_bufnr,
+                  single_cb = cb,
+                  multiple_cb = cb,
+                  get_item = function(selection)
+                    return selection.label
+                  end,
+                }
               end)
               return true
             end,
@@ -775,9 +842,14 @@ function M.select_assigned_label(cb)
             sorter = conf.generic_sorter(opts),
             attach_mappings = function(_, _)
               actions.select_default:replace(function(prompt_bufnr)
-                local selected_label = action_state.get_selected_entry(prompt_bufnr)
-                actions.close(prompt_bufnr)
-                cb(selected_label.label.id)
+                select {
+                  bufnr = prompt_bufnr,
+                  single_cb = cb,
+                  multiple_cb = cb,
+                  get_item = function(selection)
+                    return selection.label
+                  end,
+                }
               end)
               return true
             end,
@@ -1129,26 +1201,94 @@ function M.issue_templates(templates, cb)
     :find()
 end
 
+function M.discussions(opts)
+  opts = opts or {}
+
+  if opts.cb == nil then
+    opts.cb = function(selected, _)
+      local url = selected.obj.url
+      navigation.open_in_browser_raw(url)
+    end
+  end
+
+  local owner, name = utils.split_repo(opts.repo)
+  local cfg = octo_config.values
+  local order_by = cfg.discussions.order_by
+  local query = graphql("discussions_query", owner, name, order_by.field, order_by.direction, { escape = false })
+  utils.info "Fetching discussions (this may take a while) ..."
+  gh.run {
+    args = { "api", "graphql", "--paginate", "--jq", ".", "-f", string.format("query=%s", query) },
+    cb = function(output, stderr)
+      if stderr and not utils.is_blank(stderr) then
+        utils.error(stderr)
+        return
+      end
+
+      local resp = utils.aggregate_pages(output, "data.repository.discussions.node")
+      local discussions = resp.data.repository.discussions.nodes
+
+      local max_number = -1
+      for _, discussion in ipairs(discussions) do
+        if #tostring(discussion.number) > max_number then
+          max_number = #tostring(discussion.number)
+        end
+      end
+
+      if #discussions == 0 then
+        utils.error(string.format("There are no matching discussions in %s.", opts.repo))
+        return
+      end
+
+      local cfg = octo_config.values
+      local replace = function(prompt_bufnr, type)
+        local selected = action_state.get_selected_entry(prompt_bufnr)
+        actions.close(prompt_bufnr)
+        opts.cb(selected, prompt_bufnr, type)
+      end
+
+      opts.preview_title = opts.preview_title or ""
+
+      pickers
+        .new(opts, {
+          finder = finders.new_table {
+            results = discussions,
+            entry_maker = entry_maker.gen_from_discussions(max_number),
+          },
+          sorter = conf.generic_sorter(opts),
+          previewer = previewers.discussion.new(opts),
+          attach_mappings = function(_, map)
+            action_set.select:replace(replace)
+
+            map("i", cfg.picker_config.mappings.copy_url.lhs, copy_url())
+            return true
+          end,
+        })
+        :find()
+    end,
+  }
+end
+
 M.picker = {
-  issues = M.issues,
-  prs = M.pull_requests,
-  gists = M.gists,
-  commits = M.commits,
-  review_commits = M.review_commits,
+  actions = M.actions,
+  assigned_labels = M.select_assigned_label,
+  assignees = M.select_assignee,
   changed_files = M.changed_files,
+  commits = M.commits,
+  discussions = M.discussions,
+  gists = M.gists,
+  issue_templates = M.issue_templates,
+  issues = M.issues,
+  labels = M.select_label,
   pending_threads = M.pending_threads,
   project_cards = M.select_project_card,
   project_cards_v2 = M.not_implemented,
   project_columns = M.select_target_project_column,
   project_columns_v2 = M.not_implemented,
-  labels = M.select_label,
-  assigned_labels = M.select_assigned_label,
-  users = M.select_user,
-  assignees = M.select_assignee,
+  prs = M.pull_requests,
   repos = M.repos,
+  review_commits = M.review_commits,
   search = M.search,
-  actions = M.actions,
-  issue_templates = M.issue_templates,
+  users = M.select_user,
 }
 
 return M

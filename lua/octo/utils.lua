@@ -1,12 +1,15 @@
 local config = require "octo.config"
 local constants = require "octo.constants"
-local date = require "octo.date"
 local gh = require "octo.gh"
 local graphql = require "octo.gh.graphql"
 local _, Job = pcall(require, "plenary.job")
 local vim = vim
 
 local M = {}
+
+---@class OctoRepo
+---@field host string
+---@field name string
 
 local repo_id_cache = {}
 local repo_templates_cache = {}
@@ -30,6 +33,8 @@ M.state_msg_map = {
 M.state_hl_map = {
   MERGED = "OctoStateMerged",
   CLOSED = "OctoStateClosed",
+  COMPLETED = "OctoStateCompleted",
+  NOT_PLANNED = "OctoStateNotPlanned",
   OPEN = "OctoStateOpen",
   APPROVED = "OctoStateApproved",
   CHANGES_REQUESTED = "OctoStateChangesRequested",
@@ -232,6 +237,8 @@ function M.parse_remote_url(url, aliases)
   end
 end
 
+---Parse local git remotes from git cli
+---@return OctoRepo[]
 function M.parse_git_remote()
   local conf = config.values
   local aliases = conf.ssh_aliases
@@ -254,9 +261,10 @@ function M.parse_git_remote()
   return remotes
 end
 
---- Returns first host and repo information found in a list of remote values
---- If no argument is provided, defaults to matching against config's default remote
---- @param remote table | nil list of local remotes to match against
+---Returns first host and repo information found in a list of remote values
+---If no argument is provided, defaults to matching against config's default remote
+---@param remote table | nil list of local remotes to match against
+---@return OctoRepo
 function M.get_remote(remote)
   local conf = config.values
   local remotes = M.parse_git_remote()
@@ -312,18 +320,38 @@ function M.commit_exists(commit, cb)
   }):start()
 end
 
-function M.develop_issue(issue_number)
+function M.develop_issue(issue_repo, issue_number, branch_repo)
   if not Job then
     return
+  end
+
+  if M.is_blank(branch_repo) then
+    branch_repo = M.get_remote_name()
   end
 
   Job:new({
     enable_recording = true,
     command = "gh",
-    args = { "issue", "develop", issue_number, "--checkout" },
-    on_exit = vim.schedule_wrap(function()
-      local output = vim.fn.system "git branch --show-current"
-      M.info("Switched to " .. output)
+    args = {
+      "issue",
+      "develop",
+      "--repo",
+      issue_repo,
+      issue_number,
+      "--checkout",
+      "--branch-repo",
+      branch_repo,
+    },
+    on_exit = vim.schedule_wrap(function(job, code)
+      if code == 0 then
+        local output = vim.fn.system "git branch --show-current"
+        M.info("Switched to " .. output)
+      else
+        local stderr = table.concat(job:stderr_result(), "\n")
+        if not M.is_blank(stderr) then
+          M.error(stderr)
+        end
+      end
     end),
   }):start()
 end
@@ -336,13 +364,10 @@ function M.get_file_at_commit(path, commit, cb)
     enable_recording = true,
     command = "git",
     args = { "show", string.format("%s:%s", commit, path) },
-    on_exit = vim.schedule_wrap(function(j_self, _, _)
-      local output = table.concat(j_self:result(), "\n")
-      local stderr = table.concat(j_self:stderr_result(), "\n")
-      cb(vim.split(output, "\n"), vim.split(stderr, "\n"))
-    end),
   }
-  job:start()
+  local result = job:sync()
+  local output = table.concat(result, "\n")
+  cb(vim.split(output, "\n"))
 end
 
 function M.in_pr_repo()
@@ -373,11 +398,12 @@ function M.in_pr_branch(pr)
   local cmd = "git rev-parse --abbrev-ref --symbolic-full-name @{u}"
   local local_branch_with_local_remote = vim.split(string.gsub(vim.fn.system(cmd), "%s+", ""), "/")
   local local_remote = local_branch_with_local_remote[1]
-  local local_branch = local_branch_with_local_remote[2]
+  local local_branch = table.concat(local_branch_with_local_remote, "/", 2)
 
-  local local_repo = M.get_remote_name { local_remote }
+  -- Github repos are case insensitive, ignore case when comparing to local remotes
+  local local_repo = M.get_remote_name({ local_remote }):lower()
 
-  if local_repo == pr.head_repo and local_branch == pr.head_ref_name then
+  if local_repo == pr.head_repo:lower() and local_branch == pr.head_ref_name then
     return true
   end
 
@@ -708,12 +734,20 @@ function M.get_pull_request_uri(...)
   return string.format("octo://%s/pull/%s", repo, number)
 end
 
+function M.get_discussion_uri(...)
+  local repo, number = M.get_repo_number_from_varargs(...)
+
+  return string.format("octo://%s/discussion/%s", repo, number)
+end
+
 ---Helper method opening octo buffers
 function M.get(kind, ...)
   if kind == "issue" then
     M.get_issue(...)
   elseif kind == "pull_request" then
     M.get_pull_request(...)
+  elseif kind == "discussion" then
+    M.get_discussion(...)
   elseif kind == "repo" then
     M.get_repo(...)
   end
@@ -729,6 +763,10 @@ end
 
 function M.get_pull_request(...)
   vim.cmd("edit " .. M.get_pull_request_uri(...))
+end
+
+function M.get_discussion(...)
+  vim.cmd("edit " .. M.get_discussion_uri(...))
 end
 
 function M.parse_url(url)
@@ -1308,7 +1346,7 @@ end
 ---@param events table list of events
 ---@param winnr number window id of preview window
 ---@param bufnrs table list of buffers where the preview window will remain visible
----@see |autocmd-events|
+---@see autocmd-events
 function M.close_preview_autocmd(events, winnr, bufnrs)
   local augroup = vim.api.nvim_create_augroup("preview_window_" .. winnr, {
     clear = true,
@@ -1487,6 +1525,19 @@ function M.convert_vim_mapping_to_fzf(vim_mapping)
   local fzf_mapping = string.gsub(vim_mapping, "<[cC]%-(.*)>", "ctrl-%1")
   fzf_mapping = string.gsub(fzf_mapping, "<[amAM]%-(.*)>", "alt-%1")
   return string.lower(fzf_mapping)
+end
+
+--- Logic to determine the state displayed for issue or PR
+---@param isIssue boolean
+---@param state string
+---@param stateReason string | nil
+---@return string
+function M.get_displayed_state(isIssue, state, stateReason)
+  if isIssue and state == "CLOSED" then
+    return stateReason or state
+  end
+
+  return state
 end
 
 return M

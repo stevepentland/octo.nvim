@@ -48,7 +48,9 @@ function OctoBuffer:new(opts)
     this.taggable_users = { this.node.author.login }
   elseif this.node and this.number then
     this.kind = "issue"
-    this.taggable_users = { this.node.author.login }
+    if not utils.is_blank(this.node.author) then
+      this.taggable_users = { this.node.author.login }
+    end
   elseif this.node and not this.number then
     this.kind = "repo"
   else
@@ -106,7 +108,8 @@ function OctoBuffer:render_issue()
   writers.write_details(self.bufnr, self.node)
 
   -- write issue/pr status
-  writers.write_state(self.bufnr, self.node.state:upper(), self.number)
+  local state = utils.get_displayed_state(self.kind == "issue", self.node.state, self.node.stateReason)
+  writers.write_state(self.bufnr, state:upper(), self.number)
 
   -- write body
   writers.write_body(self.bufnr, self.node)
@@ -211,6 +214,9 @@ function OctoBuffer:render_issue()
     elseif item.__typename == "ReviewDismissedEvent" then
       writers.write_review_dismissed_event(self.bufnr, item)
       prev_is_event = true
+    elseif item.__typename == "RenamedTitleEvent" then
+      writers.write_renamed_title_event(self.bufnr, item)
+      prev_is_event = true
     end
   end
   if prev_is_event then
@@ -234,7 +240,7 @@ function OctoBuffer:render_threads(threads)
   self.ready = true
 end
 
----Confgiures the buffer
+---Configures the buffer
 function OctoBuffer:configure()
   -- configure buffer
   vim.api.nvim_buf_call(self.bufnr, function()
@@ -512,13 +518,17 @@ function OctoBuffer:do_add_thread_comment(comment_metadata)
 end
 
 ---Adds a new review comment thread to the current review.
+---@return nil
 function OctoBuffer:do_add_new_thread(comment_metadata)
   --TODO: How to create a new thread on a line where there is already one
 
   local review = require("octo.reviews").get_current_review()
+  if not review then
+    return
+  end
   local layout = review.layout
   local pr = review.pull_request
-  local file = layout:cur_file()
+  local file = layout:get_current_file()
   if not file then
     utils.error "No file selected"
     return
